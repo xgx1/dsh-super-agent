@@ -76,7 +76,9 @@ export async function apply(ctx, rawConfig = {}) {
   const optional = Object.fromEntries(OPTIONAL.map(key => [key, () => ctx.get(key)]))
   const stateDir = config.stateDir && String(config.stateDir).trim() !== ''
     ? String(config.stateDir)
-    : join(process.env.DSH_PROFILE_DIR || join(homedir(), '.dsh'), 'storages', 'super-agent')
+    // DSH_HOME keeps dev/prod instances apart: without it both engines wrote the same
+    // ~/.dsh/storages/super-agent/state.json and overwrote each other every watchdog tick.
+    : join(process.env.DSH_PROFILE_DIR || process.env.DSH_HOME || join(homedir(), '.dsh'), 'storages', 'super-agent')
 
   const store = new JsonStore(stateDir)
   let ownerSessionId = config.notifySessionId || ''
@@ -141,8 +143,8 @@ export async function apply(ctx, rawConfig = {}) {
   }
 
   /** Resolves the provider/model pair this deployment uses for a role. */
-  async function modelFor(role) {
-    const configured = String((role === 'router' ? config.routerModel : config.workerModel) || '').trim()
+  async function modelFor(role, override) {
+    const configured = String(override || (role === 'router' ? config.routerModel : config.workerModel) || '').trim()
     if (configured.includes('/')) {
       const [provider, ...rest] = configured.split('/')
       return { provider, model: rest.join('/') }
@@ -249,7 +251,7 @@ export async function apply(ctx, rawConfig = {}) {
       if (resolved && !('error' in resolved)) { manager = resolved.agent; return manager }
     } catch { /* not created yet */ }
     try {
-      await ctx.sessionController.create({ sessionId: 'sa-manager', cwd: safeCwd(), agentPreset: 'standard' })
+      await ctx.sessionController.create({ sessionId: 'sa-manager', cwd: safeCwd() })
     } catch { /* another caller may have created it */ }
     try {
       const resolved = await ctx.sessionController.resolveAgent('sa-manager')
@@ -260,7 +262,8 @@ export async function apply(ctx, rawConfig = {}) {
 
   async function createWorker({ worker, assignment }) {
     // A fresh prefix avoids a stale Session id anchored to another directory by an earlier attempt.
-    const sessionId = `sa-${worker.ticketId}`
+    // The time suffix keeps new dispatches clear of old sa-t-* sessions pinned to another cwd.
+    const sessionId = `sa-${worker.ticketId}-${Date.now().toString(36)}`
     const cwd = worker.cwd || config.workerCwd || safeCwd()
     worker.cwd = cwd
     let agent = null
@@ -269,7 +272,7 @@ export async function apply(ctx, rawConfig = {}) {
     // which is what keeps the sidebar readable after dozens of tickets.
     const agents = ctx.get('agents')
     let route = null
-    try { route = await modelFor('worker') } catch { route = null }
+    try { route = await modelFor('worker', worker.model) } catch { route = null }
     if (agents && typeof agents.create === 'function') {
       try {
         const parent = worker.parentSessionId ? agents.get?.(worker.parentSessionId) : await managerAgent()
@@ -277,11 +280,11 @@ export async function apply(ctx, rawConfig = {}) {
           const handle = await agents.create({
             sessionId,
             parentAgent: parent,
-            meta: { cwd, parentSession: parent.id, origin: 'subagent', delegationDepth: 1, agentPreset: 'standard' },
+            meta: { cwd, parentSession: parent.id, origin: 'subagent', delegationDepth: 1 },
             agentOptions: route ? { provider: route.provider, model: route.model } : undefined,
           })
           agent = handle.agent
-          worker.preset = 'standard'
+          worker.preset = 'profile-default'
           worker.nested = true
           worker.parentSessionId = parent.id
         }
@@ -303,9 +306,14 @@ export async function apply(ctx, rawConfig = {}) {
           worker.presetError = `workspace=${String(error?.message ?? error)}`
         }
       }
+      // Use the profile's configured default preset, not a hardcoded 'standard': on profiles
+      // where 'standard' tool rows wait for a disabled service (e.g. dev sandboxes), the first
+      // create attempt leaves a broken Session under this id and every later attempt reuses it,
+      // so resolveAgent fails and the Worker degrades to simulated. The default preset is the
+      // one GUI Sessions run, so it resolves on every profile.
       const attempts = workspaceId !== ''
-        ? [{ workspaceId, agentPreset: 'standard' }, { workspaceId }, { cwd, agentPreset: 'standard' }, { cwd }]
-        : [{ cwd, agentPreset: 'standard' }, { cwd }]
+        ? [{ workspaceId }, { cwd }]
+        : [{ cwd }]
       for (const request of attempts) {
         try {
           await ctx.sessionController.create({ sessionId, ...request })
@@ -326,11 +334,11 @@ export async function apply(ctx, rawConfig = {}) {
     worker.sessionId = agent.id
     worker.createNote = `${worker.createNote ? `${worker.createNote} ` : ''}cwd=${cwd} sessionCwd=${agent.session?.header?.cwd ?? ''} preset=${agent.session?.header?.agentPreset ?? ''} nested=${worker.nested === true}`
     // A Session materialized before this call cannot be moved or re-preset; nested creation already
-    // picked `standard`, and the fallback recorded whatever the Host accepted.
+    // picked the profile default, and the fallback recorded whatever the Host accepted.
     worker.sessionId = agent.id
     // A fresh Session has no model selection, and the loop cannot start a request without one.
     try {
-      const route = await modelFor('worker')
+      const route = await modelFor('worker', worker.model)
       if (route) {
         await ctx.sessionController.selectModel({ sessionId, provider: route.provider, model: route.model }, signalFor())
         worker.model = `${route.provider}/${route.model}`
@@ -550,6 +558,13 @@ export async function apply(ctx, rawConfig = {}) {
   // ---------------------------------------------------------------- DSH wiring
 
   // 1. The console's data plane.
+  // In-process service for sibling plugins (e.g. dsh-task-manager): dispatch without the HTTP
+  // token dance, which cannot work on instances that boot with a random per-start token.
+  ctx.provide('superAgent', {
+    dispatch: (args) => engine.command({ command: 'dispatch', args }),
+    snapshot: () => engine.snapshot(),
+  })
+
   const disposeRoute = ctx.webServer.register({
     kind: 'prefix',
     path: '/api/super-agent',
