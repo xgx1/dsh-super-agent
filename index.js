@@ -280,7 +280,13 @@ export async function apply(ctx, rawConfig = {}) {
           const handle = await agents.create({
             sessionId,
             parentAgent: parent,
-            meta: { cwd, parentSession: parent.id, origin: 'subagent', delegationDepth: 1 },
+            // No origin:'subagent' here: the raw AgentRegistry.create does not establish the
+            // durable subagent descriptor/catalog (only the subagent manager does). Claiming
+            // subagent origin without a descriptor makes the Worker's history unloadable —
+            // generic routing rejects it as subagent-owned, subagent routing reports the
+            // descriptor corrupt. Keep the runtime parent/child delegation, persist as an
+            // ordinary Session so history loads through the normal session address.
+            meta: { cwd, parentSession: parent.id, delegationDepth: 1 },
             agentOptions: route ? { provider: route.provider, model: route.model } : undefined,
           })
           agent = handle.agent
